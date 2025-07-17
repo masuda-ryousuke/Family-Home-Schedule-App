@@ -1,1 +1,15 @@
-{}
+{
+    "t": {
+        "schedules": [],
+        "color": "skyblue"
+    },
+    "ko": {
+        "schedules": [
+            [
+                7,
+                10
+            ]
+        ],
+        "color": "lightgreen"
+    }
+}

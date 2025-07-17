@@ -29,239 +29,479 @@ class ChartCanvas(tk.Canvas):
 
         # ドラッグ操作のための状態変数（インスタンス変数として定義）
         self.drag_data = {
-            "item": None, # ドラッグ中のCanvasアイテムID
-            "mode": None,  # "move", "resize_left", "resize_right"
-            "start_x": 0, # ドラッグ開始時のX座標
-            "original_schedule": None, # ドラッグ開始時の元のスケジュール (start, end)
-            "member_name": None, # ドラッグ中のメンバー名
-            "original_schedule_tuple_index": None, # 元のスケジュールリストでのインデックス
-            "original_item_coords": None # ドラッグ開始時のアイテムの座標
+            "item": None,           # ドラッグ中のアイテムID
+            "mode": None,           # ドラッグモード ("move", "resize_left", "resize_right")
+            "start_x": 0,           # ドラッグ開始時のマウスX座標
+            "start_y": 0,           # ドラッグ開始時のマウスY座標
+            "x_offset": 0,          # アイテムの左端とマウスポインタの相対位置 (moveモード用)
+            "original_coords": None,# ドラッグ開始時のアイテムのオリジナル座標
+            "member_name": None,    # ドラッグ中のメンバー名
+            "original_schedule": None, # ドラッグ開始時の元のスケジュール (start_hour, end_hour)
+            "original_index": -1    # DataManager内の元のスケジュールのインデックス
         }
 
-        # ウィンドウのリサイズイベントをバインド
-        self.bind("<Configure>", self.on_resize)
+        # ズームレベル (1.0がデフォルト、大きいほど拡大)
+        self.zoom_level = 1.0
 
-    def on_resize(self, event):
+        # イベントバインディング
+        self.bind("<Button-1>", self.drag_start)       # 左クリックでドラッグ開始
+        self.bind("<B1-Motion>", self.drag_motion)      # ドラッグ中
+        self.bind("<ButtonRelease-1>", self.end_drag)   # ドラッグ終了
+        self.bind("<Button-3>", self.show_context_menu) # 右クリックでコンテキストメニュー表示
+        self.bind("<Motion>", self.on_mouse_motion) # マウス移動時にカーソルを変更
+
+        # ウィンドウサイズ変更イベントのバインド
+        self.bind("<Configure>", self.on_canvas_configure)
+
+    def on_canvas_configure(self, event):
         """
-        Canvasのサイズが変更されたときに呼び出される。
-        チャートを再描画して新しいサイズに合わせる。
+        Canvasのサイズが変更されたときにガントチャートを再描画する。
         """
-        # Canvasのサイズが極端に小さい場合（初期化時など）は無視
-        if event.width > 1 and event.height > 1:
-            self.update_gantt_chart()
+        self.update_gantt_chart()
 
     def get_chart_params(self):
         """
-        チャート描画に必要な動的なパラメータ（時間あたりの幅など）を計算して返す。
+        チャート描画に必要な動的なパラメータを計算して返す。
         """
-        current_chart_width = self.winfo_width()
-        current_chart_height = self.winfo_height()
+        canvas_width = self.winfo_width()
+        canvas_height = self.winfo_height()
 
-        # 左右のマージンを考慮した、チャート描画に利用可能な幅
-        available_chart_drawing_width = current_chart_width - self.MARGIN_LEFT - self.RIGHT_MARGIN
+        CHART_START_X = self.MARGIN_LEFT
+        CHART_END_X = canvas_width - self.RIGHT_MARGIN
+        CHART_WIDTH = CHART_END_X - CHART_START_X
         
-        # 1時間あたりの最小ピクセル幅を保証
-        if available_chart_drawing_width < 24 * 10: # 1時間あたり最低10pxを確保
-            available_chart_drawing_width = 24 * 10 
+        # 1時間あたりのピクセル数を計算 (ズームレベルを適用)
+        HOUR_WIDTH = (CHART_WIDTH / 24) * self.zoom_level
         
-        # 1時間あたりのピクセル幅を計算
-        dynamic_hour_width = available_chart_drawing_width / 24 
-
-        chart_start_x = self.MARGIN_LEFT
-        chart_end_x = chart_start_x + 24 * dynamic_hour_width
-
-        # メンバー数に応じたチャート全体の高さ計算（ここでは固定行高）
-        # 必要に応じて、スクロールバーの導入や行高の動的調整を検討
-        num_members = len(self.data_manager.family_members)
-        min_chart_height_needed = self.MARGIN_TOP + (num_members + 1) * self.DYNAMIC_ROW_HEIGHT
-        
-        # Canvasの高さが足りない場合、描画がはみ出す可能性を許容
-        if min_chart_height_needed > current_chart_height:
-            pass 
-
         return {
-            "hour_width": dynamic_hour_width,
-            "row_height": self.DYNAMIC_ROW_HEIGHT,
-            "chart_start_x": chart_start_x,
-            "chart_end_x": chart_end_x,
-            "chart_height": current_chart_height # Canvasの全高
+            "canvas_width": canvas_width,
+            "canvas_height": canvas_height,
+            "chart_start_x": CHART_START_X,
+            "chart_end_x": CHART_END_X,
+            "chart_width": CHART_WIDTH,
+            "hour_width": HOUR_WIDTH
         }
-
 
     def update_gantt_chart(self):
         """
-        Canvas上のガントチャートを全てクリアし、現在のデータに基づいて再描画する。
+        現在のデータに基づいてガントチャートを再描画する。
         """
-        self.delete("all") # Canvas上の全ての描画を削除
+        self.delete("all") # 既存の描画をすべてクリア
 
         params = self.get_chart_params()
-        HOUR_WIDTH = params["hour_width"]
-        ROW_HEIGHT = params["row_height"]
+        canvas_width = params["canvas_width"]
+        canvas_height = params["canvas_height"]
         CHART_START_X = params["chart_start_x"]
         CHART_END_X = params["chart_end_x"]
+        HOUR_WIDTH = params["hour_width"]
+
+        # 時間軸の描画
+        for i in range(25): # 0時から24時まで
+            x = CHART_START_X + i * HOUR_WIDTH
+            self.create_line(x, self.MARGIN_TOP, x, canvas_height, fill="lightgray")
+            if i < 24: # 24時はラインのみ、ラベルは不要
+                self.create_text(x, self.MARGIN_TOP - 10, text=f"{i}", anchor="n", font=("Arial", 9))
         
-        # Canvasの幅や高さがまだ確定していない場合（初期起動時など）は再試行
-        if self.winfo_width() < 10 or self.winfo_height() < 10:
-            self.after(100, self.update_gantt_chart)
-            return
-
-        family_members = self.data_manager.family_members # DataManagerから最新のデータを取得
-
-        if not family_members:
-            self.create_text(
-                self.winfo_width() / 2, self.winfo_height() / 2,
-                text="まだ誰も登録されていません。", fill="gray", font=("Arial", 12),
-                tags="info_text"
-            )
-            return
-
-        # 時間軸の描画 (ヘッダー: 0時から24時まで)
-        for h in range(25): 
-            x_pos = CHART_START_X + h * HOUR_WIDTH
-            if h % 2 == 0: # 偶数時間ごとにラベルを表示
-                self.create_text(x_pos, self.MARGIN_TOP - 15, text=f"{h:02d}", anchor="n", font=("Arial", 8))
-            # 縦のグリッド線
-            self.create_line(x_pos, self.MARGIN_TOP, x_pos, self.MARGIN_TOP + (len(family_members) + 1) * ROW_HEIGHT, fill="lightgray")
+        # 0時から24時の範囲を示す上部の線
+        self.create_line(CHART_START_X, self.MARGIN_TOP, CHART_END_X, self.MARGIN_TOP, fill="black", width=1)
         
-        # 上の横線
-        self.create_line(CHART_START_X, self.MARGIN_TOP, CHART_END_X, self.MARGIN_TOP, fill="black")
-
         # 各メンバーのスケジュールを描画
-        y_offset = self.MARGIN_TOP
-        for i, (name, member_data) in enumerate(family_members.items()):
-            y_offset = self.MARGIN_TOP + (i + 1) * ROW_HEIGHT
+        y_offset = self.MARGIN_TOP # 上部の時間軸の高さから開始
+        member_names = list(self.data_manager.family_members.keys())
+        
+        for i, name in enumerate(member_names):
+            y1 = y_offset + i * self.DYNAMIC_ROW_HEIGHT + 5 # 行の上部
+            y2 = y1 + self.DYNAMIC_ROW_HEIGHT - 10 # バーの高さ (少しマージンを取る)
 
-            # メンバー名ラベル
-            self.create_text(self.MARGIN_LEFT - 5, y_offset + ROW_HEIGHT / 2,
-                                     text=name, anchor="e", font=("Arial", 10, "bold"))
-
-            member_schedules = member_data['schedules']
-            member_color = member_data['color']
-
-            for j, (start, end) in enumerate(member_schedules):
-                x1 = CHART_START_X + start * HOUR_WIDTH
-                x2 = CHART_START_X + end * HOUR_WIDTH
-                y1 = y_offset + 5
-                y2 = y_offset + ROW_HEIGHT - 5
-                
-                # スケジュールバーとテキストにタグを付与
-                # タグ形式: "schedule_bar_<メンバー名>_<開始時>_<終了時>_<元の配列インデックス>"
-                bar_tag = f"schedule_bar_{name}_{start}_{end}_{j}" 
-                text_tag = f"schedule_text_{name}_{start}_{end}_{j}"
-
-                # レクタングルとテキストは同じタグセットを持つようにする
-                self.create_rectangle(x1, y1, x2, y2, fill=member_color, outline="steelblue", width=1, tags=(bar_tag, text_tag, name))
-                self.create_text((x1 + x2) / 2, (y1 + y2) / 2, text=f"{start}-{end}", fill="black", font=("Arial", 8), tags=(bar_tag, text_tag, name))
-
-                # ドラッグイベントのバインド
-                self.tag_bind(bar_tag, "<Button-1>", self.start_drag)
-                self.tag_bind(bar_tag, "<B1-Motion>", self.drag_motion)
-                self.tag_bind(bar_tag, "<ButtonRelease-1>", self.end_drag)
-                
-                # テキストにもドラッグイベントをバインド（バーと一体で操作できるように）
-                self.tag_bind(text_tag, "<Button-1>", self.start_drag)
-                self.tag_bind(text_tag, "<B1-Motion>", self.drag_motion)
-                self.tag_bind(text_tag, "<ButtonRelease-1>", self.end_drag)
-                
-                # 右クリックイベントのバインド
-                self.tag_bind(bar_tag, "<Button-3>", self.show_context_menu) # 右クリック
-                self.tag_bind(text_tag, "<Button-3>", self.show_context_menu) # 右クリック
+            # メンバー名の表示
+            self.create_text(self.MARGIN_LEFT - 5, (y1 + y2) / 2,
+                             text=name, anchor="e", font=("Arial", 10, "bold"))
             
-            # 各メンバーの行の区切り線
-            self.create_line(CHART_START_X, y_offset + ROW_HEIGHT, CHART_END_X, y_offset + ROW_HEIGHT, fill="lightgray", dash=(2,2))
+            # 各メンバーのスケジュールバーを描画
+            member_data = self.data_manager.family_members[name]
+            schedules = member_data['schedules']
+            color = member_data['color']
+
+            for schedule_index, (start_hour, end_hour) in enumerate(schedules):
+                x1 = CHART_START_X + start_hour * HOUR_WIDTH
+                x2 = CHART_START_X + end_hour * HOUR_WIDTH
+                
+                # バーがチャート範囲外にはみ出さないようにクリップ
+                x1 = max(CHART_START_X, x1)
+                x2 = min(CHART_END_X, x2)
+
+                # バーの描画
+                item_id = self.create_rectangle(x1, y1, x2, y2,
+                                                fill=color, outline="gray",
+                                                tags=(f"schedule_bar_{name}_{schedule_index}", f"member_{name}", f"schedule_{schedule_index}"))
+                
+                # テキストの描画
+                text_id = self.create_text((x1 + x2) / 2, (y1 + y2) / 2,
+                                           text=f"{start_hour:.1f}-{end_hour:.1f}", # 初期表示は.1fで統一
+                                           fill="black", font=("Arial", 8, "bold"),
+                                           tags=(f"schedule_text_{name}_{schedule_index}", f"member_{name}", f"schedule_text_{schedule_index}"))
+                
+                # バーとテキストを関連付けるために、テキストアイテムにバーのタグを付与
+                self.addtag_withtag(f"schedule_bar_{name}_{schedule_index}", text_id)
+
+                # ★修正箇所1: リサイズハンドルの描画ロジックを改善
+                # バーの幅が十分にある場合のみハンドルを描画
+                if (x2 - x1) >= (self.RESIZE_HANDLE_WIDTH * 2): 
+                    # 左ハンドル
+                    self.create_rectangle(x1, y1, x1 + self.RESIZE_HANDLE_WIDTH, y2,
+                                        fill="blue", outline="darkblue",
+                                        tags=(f"resize_handle_left_{item_id}", f"member_{name}", f"schedule_handle_left_{schedule_index}"))
+                    # 右ハンドル
+                    self.create_rectangle(x2 - self.RESIZE_HANDLE_WIDTH, y1, x2, y2,
+                                        fill="blue", outline="darkblue",
+                                        tags=(f"resize_handle_right_{item_id}", f"member_{name}", f"schedule_handle_right_{schedule_index}"))
+            
+            # メンバーごとの水平線
+            self.create_line(CHART_START_X, y2 + 5, CHART_END_X, y2 + 5, fill="lightgray", dash=(2, 2))
+
+        # 最下部の水平線 (最後のメンバーの行の下)
+        final_y = self.MARGIN_TOP + len(member_names) * self.DYNAMIC_ROW_HEIGHT + 5
+        if member_names: # メンバーがいる場合のみ描画
+             self.create_line(CHART_START_X, final_y, CHART_END_X, final_y, fill="black", width=1)
 
 
-    def start_drag(self, event):
+        # コールバックがあれば呼び出す (例: 親ウィンドウのリストボックス更新)
+        if self.update_callback:
+            self.update_callback()
+
+    def on_mouse_motion(self, event):
         """
-        ドラッグ操作の開始時に呼び出される。
-        ドラッグ中のアイテム、モード（移動/リサイズ）、開始位置などを設定する。
+        マウスがCanvas上を移動したときにカーソルの形状を変更する。
         """
-        item = self.find_closest(event.x, event.y)[0] # クリックされた位置に最も近いアイテム
-        tags = self.gettags(item) # アイテムに付与されたタグを取得
+        params = self.get_chart_params()
+        CHART_START_X = params["chart_start_x"]
+        CHART_END_X = params["chart_end_x"]
+        # HOUR_WIDTH = params["hour_width"] # 未使用
+
+        # チャート範囲外ではデフォルトカーソル
+        if not (CHART_START_X <= event.x <= CHART_END_X):
+            self.config(cursor="") 
+            return
+
+        # マウス下のアイテムを特定
+        item_ids = self.find_overlapping(event.x - 1, event.y - 1, event.x + 1, event.y + 1)
         
-        # スケジュールバーまたはテキストアイテムに紐付けられたタグを探す
-        found_bar_tag = None
+        current_cursor = ""
+        for item_id in item_ids:
+            tags = self.gettags(item_id)
+            if f"resize_handle_left_{item_id}" in tags or f"resize_handle_right_{item_id}" in tags:
+                current_cursor = "sb_h_double_arrow"
+                break # ハンドルが見つかったら最優先
+            elif any(tag.startswith("schedule_bar_") for tag in tags):
+                current_cursor = "fleur" # バー本体
+
+        self.config(cursor=current_cursor)
+
+
+    def drag_start(self, event):
+        """
+        ドラッグ操作の開始を処理する。
+        """
+        item = self.find_closest(event.x, event.y)
+        if not item: return
+
+        # クリックされたアイテムのタグを取得
+        tags = self.gettags(item)
+        
+        member_name = None
+        schedule_index = -1
+        
+        # ★修正箇所2: クリックされたアイテムがハンドルかバー本体かを正確に判定
+        is_handle_left = False
+        is_handle_right = False
+        is_bar = False
+
         for tag in tags:
+            if tag.startswith("member_"):
+                member_name = tag.split("_")[1]
             if tag.startswith("schedule_bar_"):
-                found_bar_tag = tag
-                break
+                is_bar = True
+                try:
+                    schedule_index = int(tag.split("_")[-1])
+                except ValueError:
+                    pass
+            elif tag.startswith("resize_handle_left_"):
+                is_handle_left = True
+                # ハンドルがクリックされた場合、そのハンドルが関連付けられているバーのIDを取得
+                try:
+                    bar_item_id = int(tag.split("_")[3])
+                    # バーのタグからmember_nameとschedule_indexを再取得
+                    bar_tags = self.gettags(bar_item_id)
+                    for bar_tag in bar_tags:
+                        if bar_tag.startswith("member_"):
+                            member_name = bar_tag.split("_")[1]
+                        if bar_tag.startswith("schedule_"):
+                            schedule_index = int(bar_tag.split("_")[-1])
+                    item = bar_item_id # ドラッグ対象をバー自体に設定
+                except (ValueError, IndexError):
+                    return # 不正なタグ形式の場合は処理しない
+            elif tag.startswith("resize_handle_right_"):
+                is_handle_right = True
+                try:
+                    bar_item_id = int(tag.split("_")[3])
+                    bar_tags = self.gettags(bar_item_id)
+                    for bar_tag in bar_tags:
+                        if bar_tag.startswith("member_"):
+                            member_name = bar_tag.split("_")[1]
+                        if bar_tag.startswith("schedule_"):
+                            schedule_index = int(bar_tag.split("_")[-1])
+                    item = bar_item_id # ドラッグ対象をバー自体に設定
+                except (ValueError, IndexError):
+                    return # 不正なタグ形式の場合は処理しない
         
-        if found_bar_tag:
-            self.drag_data["item"] = item
-            self.drag_data["start_x"] = event.x
-            self.drag_data["original_item_coords"] = self.coords(item)
+        # スケジュールバーまたはそのハンドルがクリックされた場合のみ処理
+        if not (is_bar or is_handle_left or is_handle_right):
+            return
 
-            parts = found_bar_tag.split('_')
-            try:
-                self.drag_data["member_name"] = parts[2]
-                self.drag_data["original_schedule"] = (int(parts[3]), int(parts[4]))
-                self.drag_data["original_schedule_tuple_index"] = int(parts[5]) # 元のインデックスも保存
-                
-                item_x1, _, item_x2, _ = self.drag_data["original_item_coords"]
-                
-                # クリック位置がリサイズハンドル範囲内か判定
-                if abs(event.x - item_x1) < self.RESIZE_HANDLE_WIDTH:
-                    self.drag_data["mode"] = "resize_left"
-                    self.config(cursor="sb_h_double_arrow") # カーソルを変更
-                elif abs(event.x - item_x2) < self.RESIZE_HANDLE_WIDTH:
-                    self.drag_data["mode"] = "resize_right"
-                    self.config(cursor="sb_h_double_arrow") # カーソルを変更
-                else:
-                    self.drag_data["mode"] = "move"
-                    self.config(cursor="hand2") # カーソルを変更
-            except (ValueError, IndexError):
-                # タグの解析に失敗した場合
-                self.drag_data["item"] = None
-                self.config(cursor="")
-        else:
-            self.config(cursor="")
+        if not member_name or schedule_index == -1:
+            return
 
+        original_schedules = self.data_manager.family_members[member_name]['schedules']
+        if not (0 <= schedule_index < len(original_schedules)):
+            return # インデックスが範囲外の場合はエラー
+
+        original_schedule = original_schedules[schedule_index]
+        
+        x1, y1, x2, y2 = self.coords(item)
+        
+        self.drag_data["item"] = item
+        self.drag_data["start_x"] = event.x
+        self.drag_data["start_y"] = event.y
+        self.drag_data["x_offset"] = event.x - x1 # マウスの位置とバーの左端のオフセット (moveモード用)
+        self.drag_data["original_coords"] = (x1, y1, x2, y2)
+        self.drag_data["member_name"] = member_name
+        self.drag_data["original_schedule"] = original_schedule
+        self.drag_data["original_index"] = schedule_index # DataManagerに渡すためのインデックス
+
+        if is_handle_left:
+            self.drag_data["mode"] = "resize_left"
+            self.config(cursor="sb_h_double_arrow")
+        elif is_handle_right:
+            self.drag_data["mode"] = "resize_right"
+            self.config(cursor="sb_h_double_arrow")
+        elif is_bar: # バー本体のドラッグ
+            self.drag_data["mode"] = "move"
+            self.config(cursor="fleur")
 
     def drag_motion(self, event):
         """
-        ドラッグ中に呼び出される。
-        アイテムを移動またはリサイズする。
+        ドラッグ操作中の移動を処理する。
         """
-        if self.drag_data["item"] and self.drag_data["mode"]:
-            dx = event.x - self.drag_data["start_x"]
-            current_coords = list(self.coords(self.drag_data["item"]))
+        if self.drag_data["item"] is None:
+            return
+
+        params = self.get_chart_params()
+        CHART_START_X = params["chart_start_x"]
+        CHART_END_X = params["chart_end_x"]
+        HOUR_WIDTH = params["hour_width"]
+        
+        current_x1, current_y1, current_x2, current_y2 = self.coords(self.drag_data["item"])
+        
+        snap_interval = 1.0 # スナップ間隔 (1.0で1時間単位、0.5で30分単位など)
+        min_duration_hours = 1.0 # スケジュールの最小持続時間 (1時間)
+
+        if self.drag_data["mode"] == "move":
+            # マウスの現在のX座標から、バーの新しい開始X座標を計算
+            new_x1_raw = event.x - self.drag_data["x_offset"]
             
-            params = self.get_chart_params()
-            HOUR_WIDTH = params["hour_width"]
-            CHART_START_X = params["chart_start_x"]
-            CHART_END_X = params["chart_end_x"]
+            # ピクセル座標を時間に変換し、丸める
+            new_start_hour_float = (new_x1_raw - CHART_START_X) / HOUR_WIDTH
+            new_start_hour_snapped = round(new_start_hour_float / snap_interval) * snap_interval
+            
+            # バーの長さは維持
+            duration = self.drag_data["original_schedule"][1] - self.drag_data["original_schedule"][0]
+            
+            # 新しい開始時間に基づいて新しい終了時間を計算
+            new_end_hour_snapped = new_start_hour_snapped + duration
 
-            if self.drag_data["mode"] == "move":
-                # バーとテキストの両方を移動させる
-                self.move(self.drag_data["item"], dx, 0)
+            # 範囲制限 (0時-24時の範囲に収める)
+            new_start_hour_snapped = max(0.0, new_start_hour_snapped)
+            new_end_hour_snapped = new_start_hour_snapped + duration # 開始時間調整後、終了時間を再計算
+            
+            # 24時を超えないように調整
+            if new_end_hour_snapped > 24.0:
+                new_end_hour_snapped = 24.0
+                new_start_hour_snapped = new_end_hour_snapped - duration
+                if new_start_hour_snapped < 0.0: # 0時より小さくなる場合は0時に固定
+                    new_start_hour_snapped = 0.0
+                    new_end_hour_snapped = new_start_hour_snapped + duration
+
+            # ピクセル座標に戻す
+            new_x1 = CHART_START_X + new_start_hour_snapped * HOUR_WIDTH
+            new_x2 = CHART_START_X + new_end_hour_snapped * HOUR_WIDTH
+
+            # バーとテキストの両方を移動させる
+            self.coords(self.drag_data["item"], new_x1, current_y1, new_x2, current_y2)
+            
+            # 関連するテキストアイテムも移動
+            tags = self.gettags(self.drag_data["item"])
+            text_tag = None
+            for tag in tags:
+                if tag.startswith("schedule_text_"):
+                    text_tag = tag
+                    break
+            if text_tag:
+                self.coords(text_tag, (new_x1 + new_x2) / 2, current_y1 + (self.DYNAMIC_ROW_HEIGHT / 2) - 5)
+                # テキストの内容もリアルタイムで更新
+                self.itemconfig(text_tag, text=f"{new_start_hour_snapped:.1f}-{new_end_hour_snapped:.1f}")
+
+
+        elif self.drag_data["mode"] == "resize_left":
+            # ★修正箇所3: 左端のリサイズロジックを改善
+            new_x1_raw = event.x
+            new_start_hour_float = (new_x1_raw - CHART_START_X) / HOUR_WIDTH
+            
+            new_start_hour_snapped = round(new_start_hour_float / snap_interval) * snap_interval
+
+            # 現在の終了時間を計算
+            current_end_hour = (current_x2 - CHART_START_X) / HOUR_WIDTH
+
+            # 最小幅の制約: 新しい開始時間が現在の終了時間から最小持続時間を引いた値より大きくならないように
+            if new_start_hour_snapped >= current_end_hour - min_duration_hours:
+                new_start_hour_snapped = current_end_hour - min_duration_hours
+            
+            # 0時より小さくならないように
+            new_start_hour_snapped = max(0.0, new_start_hour_snapped)
+
+            new_x1 = CHART_START_X + new_start_hour_snapped * HOUR_WIDTH
+            
+            # 描画の更新
+            self.coords(self.drag_data["item"], new_x1, current_y1, current_x2, current_y2)
+            self.update_text_pos_and_content(self.drag_data["item"]) # テキストも更新
+
+        elif self.drag_data["mode"] == "resize_right":
+            # ★修正箇所4: 右端のリサイズロジックを改善
+            new_x2_raw = event.x
+            new_end_hour_float = (new_x2_raw - CHART_START_X) / HOUR_WIDTH
+
+            new_end_hour_snapped = round(new_end_hour_float / snap_interval) * snap_interval
+
+            # 現在の開始時間を計算
+            current_start_hour = (current_x1 - CHART_START_X) / HOUR_WIDTH
+
+            # 最小幅の制約: 新しい終了時間が現在の開始時間から最小持続時間を足した値より小さくならないように
+            if new_end_hour_snapped <= current_start_hour + min_duration_hours:
+                new_end_hour_snapped = current_start_hour + min_duration_hours
+            
+            # 24時より大きくならないように
+            new_end_hour_snapped = min(24.0, new_end_hour_snapped)
+            
+            new_x2 = CHART_START_X + new_end_hour_snapped * HOUR_WIDTH
+
+            # 描画の更新
+            self.coords(self.drag_data["item"], current_x1, current_y1, new_x2, current_y2)
+            self.update_text_pos_and_content(self.drag_data["item"]) # テキストも更新
+
+
+    def end_drag(self, event):
+        """
+        ドラッグ操作の終了を処理し、DataManagerを更新する。
+        """
+        if self.drag_data["item"] is None:
+            self.config(cursor="") # カーソルをデフォルトに戻す
+            return
+
+        # 最終的なバーの座標を取得
+        final_x1, final_y1, final_x2, final_y2 = self.coords(self.drag_data["item"])
+
+        params = self.get_chart_params()
+        CHART_START_X = params["chart_start_x"]
+        HOUR_WIDTH = params["hour_width"]
+
+        # ピクセル座標を時間に変換
+        new_start_hour = (final_x1 - CHART_START_X) / HOUR_WIDTH
+        new_end_hour = (final_x2 - CHART_START_X) / HOUR_WIDTH
+
+        # 最終的な時間も丸める（表示と内部データの一貫性のため）
+        # 丸めはここでは1時間単位で確定
+        new_start_hour = round(new_start_hour)
+        new_end_hour = round(new_end_hour)
+        
+        # 0-24時間の範囲に収める
+        new_start_hour = max(0, new_start_hour)
+        new_end_hour = min(24, new_end_hour)
+
+        # 終了時間が開始時間よりも小さくならないように調整（最小1時間）
+        if new_end_hour <= new_start_hour:
+            new_end_hour = new_start_hour + 1
+        
+        # デバッグ出力
+        print(f"DEBUG: Drag end. Original: {self.drag_data['original_schedule']} -> New: ({new_start_hour}, {new_end_hour})")
+
+        # DataManagerを更新
+        member_name = self.drag_data["member_name"]
+        old_schedule = self.drag_data["original_schedule"]
+        old_index = self.drag_data["original_index"]
+        new_schedule = (new_start_hour, new_end_hour)
+
+        if (new_start_hour, new_end_hour) == old_schedule:
+            print("Schedule not changed, no update needed.")
+            # 変更がなければ再描画で元に戻す（.1f表示を整数に戻すため）
+        else:
+            success, message = self.data_manager.update_schedule(
+                member_name, old_schedule, old_index, new_schedule
+            )
+            if not success:
+                messagebox.showerror("エラー", message, parent=self)
+            
+        # ドラッグ状態をリセット
+        self.drag_data = {
+            "item": None, "mode": None, "start_x": 0, "start_y": 0,
+            "x_offset": 0, "original_coords": None, "member_name": None,
+            "original_schedule": None, "original_index": -1
+        }
+        self.config(cursor="") # カーソルをデフォルトに戻す
+        self.update_gantt_chart() # 無条件で再描画するように変更
+
+
+    def show_context_menu(self, event):
+        """
+        右クリック時にコンテキストメニューを表示する。
+        """
+        item_id = self.find_closest(event.x, event.y)
+        if not item_id: return
+
+        tags = self.gettags(item_id)
+        member_name = None
+        schedule_index = -1
+        
+        for tag in tags:
+            if tag.startswith("member_"):
+                member_name = tag.split("_")[1]
+            if tag.startswith("schedule_bar_"):
+                try:
+                    schedule_index = int(tag.split("_")[-1])
+                except ValueError:
+                    pass
+        
+        if member_name and schedule_index != -1:
+            try:
+                # DataManagerから最新のスケジュールデータを取得して確認
+                schedules_for_member = self.data_manager.family_members.get(member_name, {}).get('schedules', [])
                 
-                # 関連するテキストアイテムも移動
-                tags = self.gettags(self.drag_data["item"])
-                text_tag = None
-                for tag in tags:
-                    if tag.startswith("schedule_text_"):
-                        text_tag = tag
-                        break
-                if text_tag:
-                    self.move(text_tag, dx, 0)
+                if 0 <= schedule_index < len(schedules_for_member):
+                    # オリジナルのスケジュールタプルをDataManagerから取得 (最新の状態)
+                    original_schedule = schedules_for_member[schedule_index]
 
-            elif self.drag_data["mode"] == "resize_left":
-                new_x1 = max(CHART_START_X, current_coords[0] + dx)
-                # 最小幅は1時間分 (HOUR_WIDTH)
-                new_x1 = min(new_x1, current_coords[2] - HOUR_WIDTH)
+                    menu = tk.Menu(self, tearoff=0)
+                    menu.add_command(label="スケジュールを編集",
+                                    command=lambda: self.edit_schedule_dialog(member_name, original_schedule, schedule_index))
+                    menu.add_command(label="スケジュールを削除",
+                                    command=lambda: self.delete_schedule_from_chart(member_name, original_schedule, schedule_index))
+                    
+                    menu.post(event.x_root, event.y_root)
+                else:
+                    print(f"DEBUG: Context menu click: schedule_index {schedule_index} out of bounds for member {member_name}.")
+            except KeyError:
+                print(f"DEBUG: Context menu click: Member '{member_name}' not found in data_manager.")
+            except Exception as e:
+                print(f"DEBUG: Error getting schedule data for context menu: {e}")
 
-                self.coords(self.drag_data["item"], new_x1, current_coords[1], current_coords[2], current_coords[3])
-                self.update_text_pos_and_content(self.drag_data["item"]) # テキストも更新
-
-            elif self.drag_data["mode"] == "resize_right":
-                new_x2 = min(CHART_END_X, current_coords[2] + dx)
-                # 最小幅は1時間分 (HOUR_WIDTH)
-                new_x2 = max(new_x2, current_coords[0] + HOUR_WIDTH)
-
-                self.coords(self.drag_data["item"], current_coords[0], current_coords[1], new_x2, current_coords[3])
-                self.update_text_pos_and_content(self.drag_data["item"]) # テキストも更新
-
-            self.drag_data["start_x"] = event.x # 次の移動のための開始点を更新
 
     def update_text_pos_and_content(self, item_id):
         """
@@ -283,200 +523,82 @@ class ChartCanvas(tk.Canvas):
             params = self.get_chart_params()
             HOUR_WIDTH = params["hour_width"]
             CHART_START_X = params["chart_start_x"]
-            CHART_END_X = params["chart_end_x"] # クランプ範囲のため追加
 
-            current_start_px = max(CHART_START_X, min(CHART_END_X, x1))
-            current_end_px = max(CHART_START_X, min(CHART_END_X, x2))
-
-            current_start_hour = (current_start_px - CHART_START_X) / HOUR_WIDTH
-            current_end_hour = (current_end_px - CHART_START_X) / HOUR_WIDTH
+            # 現在のピクセル座標から時間に変換
+            current_start_hour_float = (x1 - CHART_START_X) / HOUR_WIDTH
+            current_end_hour_float = (x2 - CHART_START_X) / HOUR_WIDTH
             
-            # 最小1時間の幅を維持
-            if current_end_hour - current_start_hour < 1.0:
-                if self.drag_data["mode"] == "resize_left":
-                    current_start_hour = current_end_hour - 1.0
-                elif self.drag_data["mode"] == "resize_right":
-                    current_end_hour = current_start_hour + 1.0
-                else: # moveの場合
-                    # 移動中に幅が1時間を下回る場合、開始・終了を調整
-                    if current_start_hour > current_end_hour - 1.0:
-                        current_end_hour = current_start_hour + 1.0
-
-            self.itemconfig(text_tag, text=f"{current_start_hour:.1f}-{current_end_hour:.1f}")
+            # リサイズ中は、表示を小数点第一位まで更新
+            self.itemconfig(text_tag, text=f"{current_start_hour_float:.1f}-{current_end_hour_float:.1f}")
             self.coords(text_tag, (x1 + x2) / 2, (y1 + y2) / 2)
 
 
-    def end_drag(self, event):
-        """
-        ドラッグ操作の終了時に呼び出される。
-        新しいスケジュール時間を確定し、DataManagerを更新する。
-        """
-        if self.drag_data["item"] and self.drag_data["mode"]:
-            coords = self.coords(self.drag_data["item"])
-            
-            params = self.get_chart_params()
-            HOUR_WIDTH = params["hour_width"]
-            CHART_START_X = params["chart_start_x"]
-            CHART_END_X = params["chart_end_x"]
-
-            # ピクセル座標を時間に変換（最も近い整数に丸める）
-            new_start_hour = int(round((coords[0] - CHART_START_X) / HOUR_WIDTH))
-            new_end_hour = int(round((coords[2] - CHART_START_X) / HOUR_WIDTH))
-
-            # 時間範囲を0-24にクランプ
-            new_start_hour = max(0, new_start_hour)
-            new_end_hour = min(24, new_end_hour)
-            
-            # 開始時間 >= 終了時間の場合の調整（最小1時間幅を保証）
-            if new_start_hour >= new_end_hour:
-                if self.drag_data["mode"] == "resize_left":
-                    new_start_hour = new_end_hour - 1
-                else: # move or resize_right
-                    new_end_hour = new_start_hour + 1
-                
-                # 再度クランプ
-                new_start_hour = max(0, new_start_hour)
-                new_end_hour = min(24, new_end_hour)
-
-            # 変更がなければDataManagerの更新は行わない（無駄な保存・再描画を避ける）
-            if (new_start_hour, new_end_hour) == self.drag_data["original_schedule"]:
-                print("Schedule not changed, no update needed.")
-                self.update_gantt_chart() # 変更がなければ再描画で元に戻す（.1f表示を整数に戻すため）
-            else:
-                # DataManagerを介してスケジュールを更新
-                success, message = self.data_manager.update_schedule(
-                    self.drag_data["member_name"], 
-                    self.drag_data["original_schedule"], 
-                    self.drag_data["original_schedule_tuple_index"], 
-                    (new_start_hour, new_end_hour)
-                )
-                if not success:
-                    messagebox.showerror("エラー", message, parent=self)
-                # DataManagerのupdate_scheduleメソッドがsave_dataとupdate_gantt_chartを呼び出すため、ここでは不要
-
-            # ドラッグ状態をリセット
-            self.drag_data = { 
-                "item": None, "mode": None, "start_x": 0, 
-                "original_schedule": None, "member_name": None, 
-                "original_schedule_tuple_index": None, "original_item_coords": None
-            }
-            self.config(cursor="") # カーソルをデフォルトに戻す
-
-
-    def show_context_menu(self, event):
-        """
-        右クリック時にコンテキストメニューを表示する。
-        「スケジュールを編集」と「このスケジュールを削除」のオプションを提供する。
-        """
-        item = self.find_closest(event.x, event.y)[0] # クリックされたアイテム
-        tags = self.gettags(item) # アイテムに付与されたタグ
-
-        found_bar_tag = None
-        for tag in tags:
-            if tag.startswith("schedule_bar_"):
-                found_bar_tag = tag
-                break
-        
-        if found_bar_tag:
-            # タグからスケジュール情報を抽出
-            parts = found_bar_tag.split('_')
-            try:
-                member_name = parts[2]
-                start_hour = int(parts[3])
-                end_hour = int(parts[4])
-                original_index = int(parts[5])
-                
-                context_menu = tk.Menu(self, tearoff=0) # コンテキストメニューを作成
-                
-                # 「スケジュールを編集」オプション
-                context_menu.add_command(
-                    label=f"スケジュールを編集 ({start_hour}-{end_hour})",
-                    command=lambda: self.edit_schedule_dialog(
-                        member_name, (start_hour, end_hour), original_index
-                    )
-                )
-                
-                # 「このスケジュールを削除」オプション
-                context_menu.add_command(
-                    label=f"このスケジュールを削除 ({start_hour}-{end_hour})",
-                    command=lambda: self.delete_schedule_from_chart(
-                        member_name, (start_hour, end_hour), original_index
-                    )
-                )
-                context_menu.post(event.x_root, event.y_root) # マウスの現在位置にメニューを表示
-
-            except (ValueError, IndexError) as e:
-                print(f"Error parsing schedule tag: {e}")
-                pass # タグ解析エラーの場合はメニューを表示しない
-
     def edit_schedule_dialog(self, member_name, old_schedule, original_index):
         """
-        スケジュール編集用のダイアログを表示し、ユーザーからの入力を受け付ける。
+        スケジュール編集用のダイアログを表示する。
+        :param member_name: スケジュールを編集するメンバーの名前
+        :param old_schedule: 編集前のスケジュール (start_hour, end_hour) のタプル
+        :param original_index: 元のスケジュールリストでのインデックス
         """
-        # ダイアログウィンドウの作成
-        dialog = tk.Toplevel(self) # 親をChartCanvasのインスタンスにする
-        dialog.title(f"{member_name} のスケジュールを編集")
-        dialog.transient(self.master) # 親ウィンドウ（ScheduleAppのルート）のアイコン表示
-        dialog.grab_set() # モーダルにする (親ウィンドウを操作できないようにする)
-        dialog.focus_set() # フォーカスをダイアログに設定
+        dialog = tk.Toplevel(self)
+        dialog.title("スケジュール編集")
+        dialog.transient(self.master) # 親ウィンドウの上に表示
+        dialog.grab_set() # 親ウィンドウの操作を無効化
 
-        # ダイアログ内のフレーム
-        dialog_frame = ttk.Frame(dialog, padding="15")
-        dialog_frame.pack(fill=tk.BOTH, expand=True)
+        tk.Label(dialog, text=f"{member_name} のスケジュールを編集:").pack(pady=5)
 
-        ttk.Label(dialog_frame, text=f"メンバー: {member_name}").grid(row=0, column=0, columnspan=2, pady=5)
-        
-        ttk.Label(dialog_frame, text="開始時間 (0-23):").grid(row=1, column=0, sticky="w", pady=2)
-        start_entry = ttk.Entry(dialog_frame, width=5)
-        start_entry.insert(0, str(old_schedule[0])) # 現在の開始時間を表示
-        start_entry.grid(row=1, column=1, sticky="ew", pady=2)
+        # 現在のスケジュールを表示
+        tk.Label(dialog, text=f"現在の時間: {old_schedule[0]}時 - {old_schedule[1]}時").pack(pady=5)
 
-        ttk.Label(dialog_frame, text="終了時間 (1-24):").grid(row=2, column=0, sticky="w", pady=2)
-        end_entry = ttk.Entry(dialog_frame, width=5)
-        end_entry.insert(0, str(old_schedule[1])) # 現在の終了時間を表示
-        end_entry.grid(row=2, column=1, sticky="ew", pady=2)
+        # 新しい開始時間の入力
+        tk.Label(dialog, text="新しい開始時間 (0-23):").pack(pady=(10, 0))
+        start_hour_entry = ttk.Entry(dialog)
+        start_hour_entry.insert(0, str(int(old_schedule[0]))) # 整数として初期表示
+        start_hour_entry.pack(pady=5)
+
+        # 新しい終了時間の入力
+        tk.Label(dialog, text="新しい終了時間 (1-24):").pack(pady=(10, 0))
+        end_hour_entry = ttk.Entry(dialog)
+        end_hour_entry.insert(0, str(int(old_schedule[1]))) # 整数として初期表示
+        end_hour_entry.pack(pady=5)
 
         def on_ok():
-            """「変更」ボタンが押されたときの処理。入力値を検証し、スケジュールを更新する。"""
             try:
-                new_start = int(start_entry.get())
-                new_end = int(end_entry.get())
+                new_start = int(start_hour_entry.get())
+                new_end = int(end_hour_entry.get())
 
-                if not (0 <= new_start <= 23 and 0 <= new_end <= 24 and new_start < new_end):
-                    messagebox.showwarning("入力エラー", "時間は0から24の整数で、開始時間は終了時間より小さくしてください。", parent=dialog)
+                if not (0 <= new_start <= 23) or not (1 <= new_end <= 24):
+                    messagebox.showwarning("入力エラー", "時間は0-23 (開始) または 1-24 (終了) の範囲で入力してください。", parent=dialog)
                     return
-                
-                new_schedule_tuple = (new_start, new_end)
-
-                if new_schedule_tuple == old_schedule:
-                    messagebox.showinfo("情報", "スケジュールは変更されていません。", parent=dialog)
-                    dialog.destroy()
+                if new_start >= new_end:
+                    messagebox.showwarning("入力エラー", "開始時間は終了時間より前に設定してください。", parent=dialog)
                     return
 
-                # DataManagerを介してスケジュールを更新
-                success, message = self.data_manager.update_schedule(member_name, old_schedule, original_index, new_schedule_tuple)
+                new_schedule = (new_start, new_end)
+                success, message = self.data_manager.update_schedule(
+                    member_name, old_schedule, original_index, new_schedule
+                )
                 if success:
-                    dialog.destroy() # 成功したらダイアログを閉じる
+                    self.update_gantt_chart()
+                    dialog.destroy()
                 else:
                     messagebox.showerror("エラー", message, parent=dialog)
-                
+                    dialog.destroy() # エラーでもダイアログを閉じる
+
             except ValueError:
                 messagebox.showwarning("入力エラー", "開始時間と終了時間は数字で入力してください。", parent=dialog)
+                dialog.destroy() # エラーでもダイアログを閉じる
             except Exception as e:
                 messagebox.showerror("エラー", f"スケジュールの更新中にエラーが発生しました: {e}", parent=dialog)
+                dialog.destroy() # エラーでもダイアログを閉じる
 
         def on_cancel():
-            """「キャンセル」ボタンが押されたときの処理。ダイアログを閉じる。"""
             dialog.destroy()
 
-        button_frame = ttk.Frame(dialog_frame)
-        button_frame.grid(row=3, column=0, columnspan=2, pady=10)
-
-        ok_button = ttk.Button(button_frame, text="変更", command=on_ok)
-        ok_button.pack(side=tk.LEFT, padx=5)
-
-        cancel_button = ttk.Button(button_frame, text="キャンセル", command=on_cancel)
-        cancel_button.pack(side=tk.LEFT, padx=5)
+        button_frame = ttk.Frame(dialog)
+        button_frame.pack(pady=10)
+        ttk.Button(button_frame, text="OK", command=on_ok).pack(side=tk.LEFT, padx=5)
+        ttk.Button(button_frame, text="キャンセル", command=on_cancel).pack(side=tk.RIGHT, padx=5)
 
         # Enterキーでの確定、Escapeキーでのキャンセルをバインド
         dialog.bind("<Return>", lambda event: on_ok())
@@ -503,7 +625,7 @@ class ChartCanvas(tk.Canvas):
         if messagebox.askyesno("確認", f"'{member_name}' のスケジュール {schedule_to_delete[0]}時-{schedule_to_delete[1]}時 を削除しますか？", parent=self):
             success, message = self.data_manager.delete_schedule(member_name, schedule_to_delete, original_index)
             if success:
-                messagebox.showinfo("削除完了", message, parent=self)
+                messagebox.showinfo("成功", message, parent=self)
+                self.update_gantt_chart() # チャートを再描画
             else:
                 messagebox.showerror("エラー", message, parent=self)
-            # DataManagerのdelete_scheduleメソッドがsave_dataとupdate_gantt_chartを呼び出すため、ここでは不要
